@@ -1,0 +1,29 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+.env
+
+# Data (heavy)
+data/
+*.parquet
+
+# Training artifacts
+artifacts/models/
+artifacts/logs/
+wandb/
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
