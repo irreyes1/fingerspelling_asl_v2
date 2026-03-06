@@ -78,9 +78,13 @@ def _center_and_scale_frames(X: np.ndarray, landmark_scale_mode: str = "median_r
     if landmark_scale_mode == "median_radius":
         radii = np.linalg.norm(pts[:, :, :2], axis=2)  # (T, N)
         valid = radii > 1e-6
-        scale = np.where(valid, radii, np.nan)
-        scale = np.nanmedian(scale, axis=1)
-        scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0).astype(np.float32)
+        scale = np.ones((T,), dtype=np.float32)
+        valid_rows = np.any(valid, axis=1)
+        if np.any(valid_rows):
+            scale_rows = np.where(valid[valid_rows], radii[valid_rows], np.nan)
+            med = np.nanmedian(scale_rows, axis=1)
+            med = np.where(np.isfinite(med) & (med > 1e-6), med, 1.0).astype(np.float32)
+            scale[valid_rows] = med
         pts = pts / scale[:, None, None]
 
     return pts.reshape(T, D).astype(np.float32)

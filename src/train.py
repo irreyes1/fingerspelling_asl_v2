@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import subprocess
+import time
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -73,6 +75,14 @@ def parse_wandb_tags(tags_raw: str):
         return None
     tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
     return tags if tags else None
+
+
+def get_git_commit() -> str:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
+        return out.decode("utf-8").strip()
+    except Exception:
+        return "unknown"
 
 
 def collect_gt_pred_examples(
@@ -411,11 +421,14 @@ def main():
     best_epoch = -1
     epochs_no_improve = 0
     global_step = 0
+    history_rows = []
+    t_train_start = time.time()
 
     best_ckpt_path = os.path.join("artifacts", "models", f"{run_name}_best.pt")
     os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
 
     for epoch in range(args.epochs):
+        t_epoch_start = time.time()
         model.train()
         losses = []
         blank_ratios = []
@@ -501,6 +514,23 @@ def main():
             f"WER={metrics['wer']:.4f} | ExactMatch={metrics['sequence_accuracy']:.4f} | "
             f"AvgEditDist={metrics['avg_edit_distance']:.4f}"
         )
+        epoch_time_sec = float(time.time() - t_epoch_start)
+        print(f"Epoch {epoch + 1}: time={epoch_time_sec:.1f}s")
+
+        history_rows.append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": mean_loss,
+                "blank_ratio_pred": mean_blank_ratio,
+                "input_target_len_ratio": mean_in_tar_ratio,
+                "val_cer": metrics["cer"],
+                "val_wer": metrics["wer"],
+                "val_exact_match": metrics["sequence_accuracy"],
+                "val_avg_edit_distance": metrics["avg_edit_distance"],
+                "epoch_time_sec": epoch_time_sec,
+                "global_step": global_step,
+            }
+        )
 
         # Save epoch checkpoint unless best-only mode.
         if not args.save_best_only:
@@ -553,6 +583,28 @@ def main():
             split_name="val",
             n_examples=5,
         )
+
+    # Persist epoch history as CSV for quick analysis/review.
+    hist_csv = os.path.join(log_path, "metrics_history.csv")
+    pd.DataFrame(history_rows).to_csv(hist_csv, index=False)
+
+    # Persist run manifest for reproducibility and MLOps traceability.
+    total_train_time_sec = float(time.time() - t_train_start)
+    manifest = {
+        "run_name": run_name,
+        "git_commit": get_git_commit(),
+        "best_val_cer": best_cer,
+        "best_epoch": best_epoch,
+        "epochs_requested": args.epochs,
+        "epochs_executed": len(history_rows),
+        "total_train_time_sec": total_train_time_sec,
+        "best_checkpoint_path": best_ckpt_path,
+        "logdir": log_path,
+        "config": vars(args),
+    }
+    manifest_path = os.path.join(log_path, "run_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     writer.close()
     if wandb_enabled:

@@ -96,6 +96,16 @@ Notas:
 python -m src.quick_infer --ckpt artifacts/models/<checkpoint>.pt --n 16
 ```
 
+## 5.1) Preflight (recomendado antes de entrenar)
+```bash
+python -m src.check_preflight --data_dir data/asl-fingerspelling
+```
+
+Con chequeo de compatibilidad contra checkpoint:
+```bash
+python -m src.check_preflight --data_dir data/asl-fingerspelling --use_delta_features --ckpt artifacts/models/archcmp2_tcn_bilstm_full_20260303_best.pt
+```
+
 ## 6) Webcam (MediaPipe)
 ```bash
 python -m src.realtime_webcam
@@ -112,6 +122,11 @@ Controles demo:
 - `ESPACIO`: capturar letra puntual (modo guiado).
 - `c`: limpiar `Live letters` y `Words`.
 - `ESC`: salir.
+
+## 6.1) Artefactos de trazabilidad de entrenamiento
+Cada run de `src.train` guarda en `artifacts/logs/<run_name>/`:
+- `metrics_history.csv` (metricas por epoca y tiempos)
+- `run_manifest.json` (config completa, best CER, best epoch, commit git, paths)
 
 ## 7) Modelo entrenado (ejemplo)
 Checkpoint best:
