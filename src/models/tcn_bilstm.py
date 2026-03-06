@@ -38,6 +38,7 @@ class TCNBiRNN(nn.Module):
         rnn_layers: int,
         rnn_type: str,
         output_dim: int,
+        bidirectional: bool = True,
     ):
         super().__init__()
         self.input_proj = nn.Conv1d(input_dim, proj_dim, kernel_size=1)
@@ -57,11 +58,12 @@ class TCNBiRNN(nn.Module):
             input_size=proj_dim,
             hidden_size=rnn_hidden,
             num_layers=rnn_layers,
-            bidirectional=True,
+            bidirectional=bidirectional,
             batch_first=True,
             dropout=0.0,
         )
-        self.classifier = nn.Linear(rnn_hidden * 2, output_dim)
+        rnn_out = rnn_hidden * (2 if bidirectional else 1)
+        self.classifier = nn.Linear(rnn_out, output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2)  # (B, D, T)

@@ -1,8 +1,8 @@
-import os
-import json
 import argparse
+import json
+import os
 from datetime import datetime
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import torch
@@ -16,14 +16,15 @@ try:
 except ImportError:
     wandb = None
 
-from src.models.embedded_rnn import EmbeddedRNN
 from src.data.dataset import ASLRightHandDataset, collate_fn
-from src.utils.metrics import evaluate_metrics, ctc_greedy_decode
+from src.models.embedded_rnn import EmbeddedRNN
+from src.models.tcn_bilstm import TCNBiRNN
+from src.utils.metrics import ctc_greedy_decode, evaluate_metrics
 
 CTC_BLANK_ID = 0
 
 
-def encode_phrase(phrase: str, letter_to_int: dict) -> list:
+def encode_phrase(phrase: str, letter_to_int: Dict[str, int]) -> List[int]:
     return [letter_to_int[c] for c in phrase if c in letter_to_int]
 
 
@@ -36,7 +37,6 @@ def build_ctc_vocab(vocab_json_path: str):
         char_to_idx = base_char_to_idx
     else:
         blank_id = CTC_BLANK_ID
-        # Reserve 0 for CTC blank and shift labels by +1
         char_to_idx = {k: v + 1 for k, v in base_char_to_idx.items()}
 
     idx_to_char = {int(v): k for k, v in char_to_idx.items()}
@@ -44,7 +44,6 @@ def build_ctc_vocab(vocab_json_path: str):
 
 
 def split_by_participant(df: pd.DataFrame, val_ratio: float = 0.2, seed: int = 42):
-    # Split by participant_id to avoid leakage
     participants = df["participant_id"].unique().tolist()
     rng = torch.Generator().manual_seed(seed)
     perm = torch.randperm(len(participants), generator=rng).tolist()
@@ -134,7 +133,6 @@ def log_examples_to_wandb(
     if len(examples) == 0:
         raise RuntimeError("Could not collect any GT/PRED examples.")
     if len(examples) < n_examples:
-        # Keep the persistent rule of logging 5 rows even on tiny subsets.
         base = list(examples)
         while len(examples) < n_examples:
             examples.append(base[(len(examples) - len(base)) % len(base)])
@@ -150,40 +148,108 @@ def log_examples_to_wandb(
     wandb.log({"examples/gt_pred": table, "global_step": global_step}, step=global_step)
 
 
+def build_dataframes(args, train_csv: str, supplemental_csv: str):
+    df = pd.read_csv(train_csv).copy()
+    df["landmarks_subdir"] = "train_landmarks"
+
+    if args.use_supplemental_data:
+        if not os.path.exists(supplemental_csv):
+            raise FileNotFoundError(f"Missing supplemental csv: {supplemental_csv}")
+        sup = pd.read_csv(supplemental_csv).copy()
+        sup["landmarks_subdir"] = "supplemental_landmarks"
+        df = pd.concat([df, sup], ignore_index=True)
+
+    required_cols = {"file_id", "sequence_id", "participant_id", "phrase", "landmarks_subdir"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"CSVs are missing columns: {missing}")
+
+    return df
+
+
+def filter_to_available_files(df: pd.DataFrame, data_dir: str):
+    keep = []
+    for subdir, group in df.groupby("landmarks_subdir"):
+        folder = os.path.join(data_dir, subdir)
+        have_ids = existing_file_ids(folder)
+        if not have_ids:
+            print(f"Warning: no parquet files in {folder}")
+            continue
+        keep.append(group[group["file_id"].isin(have_ids)])
+    if not keep:
+        return df.iloc[0:0].copy()
+    return pd.concat(keep, ignore_index=True)
+
+
+def parse_kernel_list(raw: str) -> Tuple[int, ...]:
+    vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    if len(vals) == 0:
+        return (3, 3, 3)
+    return tuple(vals)
+
+
+def create_model(args, input_dim: int, output_dim: int):
+    if args.arch == "embedded_rnn":
+        model = EmbeddedRNN(
+            input_dim=input_dim,
+            hidden_dim=args.hidden_dim,
+            output_dim=output_dim,
+        )
+    elif args.arch == "tcn_bilstm":
+        model = TCNBiRNN(
+            input_dim=input_dim,
+            proj_dim=args.tcn_proj_dim,
+            tcn_kernels=parse_kernel_list(args.tcn_kernels),
+            rnn_hidden=args.hidden_dim,
+            rnn_layers=args.num_layers,
+            rnn_type=args.rnn_type.lower(),
+            output_dim=output_dim,
+            bidirectional=args.bidirectional,
+        )
+    else:
+        raise ValueError(f"Unsupported arch: {args.arch}")
+    return model
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", type=str, default="data/asl-fingerspelling")
     p.add_argument("--train_csv", type=str, default="train.csv")
+    p.add_argument("--supplemental_csv", type=str, default="supplemental_metadata.csv")
+    p.add_argument("--use_supplemental_data", action="store_true")
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--logdir", type=str, default="artifacts/logs")
     p.add_argument("--max_frames", type=int, default=160)
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--grad_clip_norm", type=float, default=0.0)
     p.add_argument("--hidden_dim", type=int, default=128)
+    p.add_argument("--arch", type=str, default="embedded_rnn", choices=["embedded_rnn", "tcn_bilstm"])
+    p.add_argument("--rnn_type", type=str, default="lstm", choices=["rnn", "gru", "lstm"])
+    p.add_argument("--num_layers", type=int, default=2)
+    p.add_argument("--bidirectional", action="store_true")
+    p.add_argument("--tcn_proj_dim", type=int, default=256)
+    p.add_argument("--tcn_kernels", type=str, default="3,3,3")
     p.add_argument("--val_ratio", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--train_size", type=int, default=200)  # small by default
+    p.add_argument("--train_size", type=int, default=200)
     p.add_argument("--val_size", type=int, default=200)
-    p.add_argument(
-        "--max_phrase_len",
-        type=int,
-        default=0,
-        help="If >0, keep only samples with phrase length <= this value.",
-    )
-    p.add_argument(
-        "--overfit_subset",
-        type=int,
-        default=0,
-        help="If >0, sample this many rows and use same subset for train/val.",
-    )
-    p.add_argument(
-        "--eval_train_metrics",
-        action="store_true",
-        help="Also compute CER/WER/ExactMatch/AvgEditDist on train split.",
-    )
+    p.add_argument("--max_phrase_len", type=int, default=0)
+    p.add_argument("--overfit_subset", type=int, default=0)
+    p.add_argument("--eval_train_metrics", action="store_true")
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--prefetch_factor", type=int, default=2)
+    p.add_argument("--disable_pin_memory", action="store_true")
+    p.add_argument("--use_delta_features", action="store_true")
+    p.add_argument("--disable_landmark_centering", action="store_true")
+    p.add_argument("--landmark_scale_mode", type=str, default="median_radius")
+    p.add_argument("--early_stopping_patience", type=int, default=0)
+    p.add_argument("--early_stopping_min_delta", type=float, default=0.0)
+    p.add_argument("--save_best_only", action="store_true")
 
-    # Optional Weights & Biases tracking
+    # Optional W&B
     p.add_argument("--use_wandb", action="store_true", help="Enable W&B logging")
     p.add_argument("--wandb_project", type=str, default="fingerspelling_asl")
     p.add_argument("--wandb_entity", type=str, default=None)
@@ -191,47 +257,64 @@ def main():
     p.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
     p.add_argument("--wandb_tags", type=str, default="", help="Comma-separated tags for W&B")
 
+    # Compatibility-only args to avoid parser mismatch with old run configs.
+    p.add_argument("--warmup_ratio", type=float, default=0.0)
+    p.add_argument("--conformer_d_model", type=int, default=256)
+    p.add_argument("--conformer_layers", type=int, default=8)
+    p.add_argument("--conformer_heads", type=int, default=4)
+    p.add_argument("--conformer_ff_expansion", type=int, default=4)
+    p.add_argument("--conformer_conv_kernel", type=int, default=15)
+    p.add_argument("--conformer_dropout", type=float, default=0.1)
+    p.add_argument("--conformer_subsample_stride", type=int, default=1)
+    p.add_argument("--augment_prob", type=float, default=0.0)
+    p.add_argument("--augment_train", action="store_true")
+    p.add_argument("--aug_landmark_drop", type=float, default=0.0)
+    p.add_argument("--aug_frame_drop", type=float, default=0.0)
+    p.add_argument("--aug_shift", type=float, default=0.0)
+    p.add_argument("--aug_scale", type=float, default=0.0)
+    p.add_argument("--aug_rot_deg", type=float, default=0.0)
+    p.add_argument("--disable_feature_norm", action="store_true")
+    p.add_argument("--disable_scale_normalization", action="store_true")
+    p.add_argument("--decode_blank_skip_threshold", type=float, default=1.0)
+    p.add_argument("--beam_size", type=int, default=1)
+    p.add_argument("--representative_proxy", action="store_true")
+    p.add_argument("--proxy_len_bins", type=int, default=4)
+    p.add_argument("--letters_only", action="store_true")
+    p.add_argument("--lowercase_phrases", action="store_true")
+    p.add_argument("--dropout", type=float, default=0.0)
+
     args = p.parse_args()
 
-    train_csv = args.train_csv
-    if not os.path.isabs(train_csv):
-        train_csv = os.path.join(args.data_dir, train_csv)
+    train_csv = args.train_csv if os.path.isabs(args.train_csv) else os.path.join(args.data_dir, args.train_csv)
+    supplemental_csv = (
+        args.supplemental_csv
+        if os.path.isabs(args.supplemental_csv)
+        else os.path.join(args.data_dir, args.supplemental_csv)
+    )
     vocab_json = os.path.join(args.data_dir, "character_to_prediction_index.json")
-    landmarks_dir = os.path.join(args.data_dir, "train_landmarks")
 
     if not os.path.exists(train_csv):
         raise FileNotFoundError(f"Missing {train_csv}")
     if not os.path.exists(vocab_json):
         raise FileNotFoundError(f"Missing {vocab_json}")
-    if not os.path.isdir(landmarks_dir):
-        raise FileNotFoundError(f"Missing folder {landmarks_dir}")
 
-    # Device
+    torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load vocab mapping (char -> id) in CTC-compatible form
     letter_to_int, int_to_letter, blank_id = build_ctc_vocab(vocab_json)
+    df = build_dataframes(args, train_csv=train_csv, supplemental_csv=supplemental_csv)
+    df = filter_to_available_files(df, data_dir=args.data_dir)
+    if len(df) == 0:
+        raise ValueError("No rows left after filtering by available parquet files.")
 
-    # Load train.csv
-    df = pd.read_csv(train_csv)
-    required_cols = {"file_id", "sequence_id", "participant_id", "phrase"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"train.csv is missing columns: {missing}")
+    if args.lowercase_phrases:
+        df["phrase"] = df["phrase"].astype(str).str.lower()
+    if args.letters_only:
+        df["phrase"] = df["phrase"].astype(str).str.replace(r"[^a-z]", "", regex=True)
 
-    # Filter by parquets you actually downloaded
-    have_ids = existing_file_ids(landmarks_dir)
-    if not have_ids:
-        raise ValueError(
-            f"No parquet files found in {landmarks_dir}. "
-            f"Download a few like 0.parquet, 1.parquet, etc."
-        )
-    df = df[df["file_id"].isin(have_ids)].copy()
-    print(f"Rows after filtering to available parquets ({len(have_ids)} file_ids): {len(df)}")
     if args.max_phrase_len > 0:
         df = df[df["phrase"].astype(str).str.len() <= args.max_phrase_len].copy()
-        print(f"Rows after filtering by max_phrase_len={args.max_phrase_len}: {len(df)}")
         if len(df) == 0:
             raise ValueError("No rows left after max_phrase_len filtering.")
 
@@ -243,50 +326,73 @@ def main():
         val_df = overfit_df.copy()
         print(f"Overfit mode enabled: using same {n_subset} samples for train and val")
     else:
-        # Split by participant_id
         train_df, val_df = split_by_participant(df, val_ratio=args.val_ratio, seed=args.seed)
-
-        # Encode targets
         train_df["encoded"] = train_df["phrase"].apply(lambda x: encode_phrase(str(x), letter_to_int))
         val_df["encoded"] = val_df["phrase"].apply(lambda x: encode_phrase(str(x), letter_to_int))
 
-        # Sample small subsets for local dev
-        if args.train_size and args.train_size < len(train_df):
+        if args.train_size and args.train_size > 0 and args.train_size < len(train_df):
             train_df = train_df.sample(args.train_size, random_state=args.seed)
-        if args.val_size and args.val_size < len(val_df):
+        if args.val_size and args.val_size > 0 and args.val_size < len(val_df):
             val_df = val_df.sample(args.val_size, random_state=args.seed)
 
     print(f"Train samples: {len(train_df)} | Val samples: {len(val_df)}")
 
-    # Datasets / loaders
-    train_ds = ASLRightHandDataset(train_df, landmarks_dir=landmarks_dir, max_frames=args.max_frames)
-    val_ds = ASLRightHandDataset(val_df, landmarks_dir=landmarks_dir, max_frames=args.max_frames)
+    train_ds = ASLRightHandDataset(
+        train_df,
+        landmarks_dir=args.data_dir,
+        max_frames=args.max_frames,
+        use_delta_features=args.use_delta_features,
+        normalize_landmarks=(not args.disable_landmark_centering),
+        landmark_scale_mode=args.landmark_scale_mode,
+    )
+    val_ds = ASLRightHandDataset(
+        val_df,
+        landmarks_dir=args.data_dir,
+        max_frames=args.max_frames,
+        use_delta_features=args.use_delta_features,
+        normalize_landmarks=(not args.disable_landmark_centering),
+        landmark_scale_mode=args.landmark_scale_mode,
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0)
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "collate_fn": collate_fn,
+        "num_workers": args.num_workers,
+        "pin_memory": not args.disable_pin_memory,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
 
-    # Model
-    # Right-hand features are typically 21 landmarks * 3 coords = 63
-    input_dim = 63
-    hidden_dim = args.hidden_dim
-    # output_dim must match max id + 1 (including blank=0)
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
+
+    # Infer input dim from first valid batch.
+    first_batch = None
+    for b in train_loader:
+        if b is not None:
+            first_batch = b
+            break
+    if first_batch is None:
+        raise RuntimeError("No valid training batch found. Check data filters and phrase encoding.")
+
+    X0, _, _, _ = first_batch
+    input_dim = int(X0.shape[2])
     output_dim = max(int_to_letter.keys()) + 1
 
-    model = EmbeddedRNN(input_dim, hidden_dim, output_dim).to(device)
-
+    model = create_model(args, input_dim=input_dim, output_dim=output_dim).to(device)
     criterion = nn.CTCLoss(blank=blank_id, zero_infinity=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
-    # Tracking setup
     run_name = args.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
-
-    # TensorBoard
     log_path = os.path.join(args.logdir, run_name)
     os.makedirs(log_path, exist_ok=True)
     writer = SummaryWriter(log_path)
     print(f"TensorBoard logdir: {log_path}")
 
-    # Weights & Biases
     wandb_enabled = args.use_wandb and args.wandb_mode != "disabled"
     if args.use_wandb and wandb is None:
         raise ImportError("wandb is not installed. Run: pip install wandb")
@@ -301,7 +407,14 @@ def main():
             tags=parse_wandb_tags(args.wandb_tags),
         )
 
+    best_cer = float("inf")
+    best_epoch = -1
+    epochs_no_improve = 0
     global_step = 0
+
+    best_ckpt_path = os.path.join("artifacts", "models", f"{run_name}_best.pt")
+    os.makedirs(os.path.dirname(best_ckpt_path), exist_ok=True)
+
     for epoch in range(args.epochs):
         model.train()
         losses = []
@@ -313,16 +426,16 @@ def main():
             if batch is None:
                 continue
             X, Y, in_lens, tar_lens = batch
-            X = X.to(device)
+            X = X.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             log_probs = model(X)  # (T, B, C)
-
             loss = criterion(log_probs, Y, in_lens, tar_lens)
             loss.backward()
+            if args.grad_clip_norm and args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
             optimizer.step()
 
-            # Simple diagnostics: blank-token dominance and input/target length ratio.
             with torch.no_grad():
                 pred_ids = torch.argmax(log_probs, dim=2)  # (T, B)
                 blank_mask = (pred_ids == blank_id).float()
@@ -332,11 +445,9 @@ def main():
 
             loss_val = float(loss.item())
             losses.append(loss_val)
-
             writer.add_scalar("loss/train_step", loss_val, global_step)
             if wandb_enabled:
                 wandb.log({"loss/train_step": loss_val, "global_step": global_step}, step=global_step)
-
             global_step += 1
             pbar.set_postfix(loss=loss_val)
 
@@ -350,26 +461,13 @@ def main():
 
         train_metrics = None
         if args.eval_train_metrics:
-            train_metrics = evaluate_metrics(
-                model,
-                train_loader,
-                int_to_letter=int_to_letter,
-                device=device,
-                blank_id=blank_id,
-            )
+            train_metrics = evaluate_metrics(model, train_loader, int_to_letter=int_to_letter, device=device, blank_id=blank_id)
             writer.add_scalar("cer/train", train_metrics["cer"], epoch)
             writer.add_scalar("wer/train", train_metrics["wer"], epoch)
             writer.add_scalar("sequence_accuracy/train", train_metrics["sequence_accuracy"], epoch)
             writer.add_scalar("avg_edit_distance/train", train_metrics["avg_edit_distance"], epoch)
 
-        # Validation metrics
-        metrics = evaluate_metrics(
-            model,
-            val_loader,
-            int_to_letter=int_to_letter,
-            device=device,
-            blank_id=blank_id,
-        )
+        metrics = evaluate_metrics(model, val_loader, int_to_letter=int_to_letter, device=device, blank_id=blank_id)
         writer.add_scalar("cer/val", metrics["cer"], epoch)
         writer.add_scalar("wer/val", metrics["wer"], epoch)
         writer.add_scalar("sequence_accuracy/val", metrics["sequence_accuracy"], epoch)
@@ -398,40 +496,51 @@ def main():
                 )
             wandb.log(payload, step=global_step)
 
-        if train_metrics is not None:
-            print(
-                f"Epoch {epoch + 1}: "
-                f"train CER={train_metrics['cer']:.4f} | "
-                f"WER={train_metrics['wer']:.4f} | "
-                f"ExactMatch={train_metrics['sequence_accuracy']:.4f} | "
-                f"AvgEditDist={train_metrics['avg_edit_distance']:.4f}"
-            )
         print(
-            f"Epoch {epoch + 1}: "
-            f"diag blank_ratio_pred={mean_blank_ratio:.4f} | "
-            f"input/target ratio={mean_in_tar_ratio:.2f}"
-        )
-
-        print(
-            f"Epoch {epoch + 1}: "
-            f"val CER={metrics['cer']:.4f} | "
-            f"WER={metrics['wer']:.4f} | "
-            f"ExactMatch={metrics['sequence_accuracy']:.4f} | "
+            f"Epoch {epoch + 1}: val CER={metrics['cer']:.4f} | "
+            f"WER={metrics['wer']:.4f} | ExactMatch={metrics['sequence_accuracy']:.4f} | "
             f"AvgEditDist={metrics['avg_edit_distance']:.4f}"
         )
 
-        # Save checkpoint
-        ckpt_path = os.path.join("artifacts", "models", f"{run_name}_epoch{epoch + 1}.pt")
-        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-        torch.save(
-            {
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "config": vars(args),
-            },
-            ckpt_path,
-        )
+        # Save epoch checkpoint unless best-only mode.
+        if not args.save_best_only:
+            ckpt_path = os.path.join("artifacts", "models", f"{run_name}_epoch{epoch + 1}.pt")
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": vars(args),
+                },
+                ckpt_path,
+            )
+
+        # Best checkpoint and early stopping
+        val_cer = metrics["cer"]
+        if val_cer + args.early_stopping_min_delta < best_cer:
+            best_cer = val_cer
+            best_epoch = epoch + 1
+            epochs_no_improve = 0
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": vars(args),
+                },
+                best_ckpt_path,
+            )
+            print(f"Epoch {epoch + 1}: new best val CER={best_cer:.4f} (saved best checkpoint: {best_ckpt_path})")
+        else:
+            epochs_no_improve += 1
+
+        if args.early_stopping_patience > 0 and epochs_no_improve >= args.early_stopping_patience:
+            print(
+                f"Early stopping at epoch {epoch + 1}: "
+                f"no val CER improvement for {epochs_no_improve} epochs. "
+                f"Best={best_cer:.4f} at epoch {best_epoch}."
+            )
+            break
 
     if wandb_enabled:
         log_examples_to_wandb(

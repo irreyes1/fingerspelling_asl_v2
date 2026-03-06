@@ -64,6 +64,33 @@ Flags utiles:
 - `src/models/tcn_bilstm.py`: arquitectura del run final `archcmp2_tcn_bilstm_full_20260303`.
 - `src/model_loader.py`: factory que detecta la arquitectura del checkpoint y carga el modelo correcto.
 
+## 4.2) Comando recomendado (pipeline alineado con run final)
+```bash
+python -m src.train \
+  --data_dir data/asl-fingerspelling \
+  --use_supplemental_data \
+  --arch tcn_bilstm \
+  --hidden_dim 256 \
+  --num_layers 2 \
+  --bidirectional \
+  --use_delta_features \
+  --max_frames 160 \
+  --batch_size 16 \
+  --lr 5e-4 \
+  --weight_decay 1e-4 \
+  --num_workers 2 \
+  --prefetch_factor 2 \
+  --early_stopping_patience 8 \
+  --early_stopping_min_delta 0.001 \
+  --lowercase_phrases \
+  --letters_only \
+  --use_wandb --wandb_project fingerspelling_asl
+```
+
+Notas:
+- El entrenamiento ahora guarda checkpoint `best` automaticamente.
+- `src.train` soporta train+supplemental y mezcla `train_landmarks` / `supplemental_landmarks`.
+
 ## 5) Inferencia rapida de checkpoint
 ```bash
 python -m src.quick_infer --ckpt artifacts/models/<checkpoint>.pt --n 16

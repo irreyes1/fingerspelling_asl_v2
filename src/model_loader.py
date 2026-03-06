@@ -70,6 +70,7 @@ def _build_tcn_birnn_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Loa
     rnn_layers = (max(layer_ids) + 1) if layer_ids else 1
 
     rnn_type = _infer_rnn_type_from_state_dict(state_dict)
+    bidirectional = any(k.startswith("rnn.weight_ih_l0_reverse") for k in state_dict.keys())
 
     model = TCNBiRNN(
         input_dim=input_dim,
@@ -79,6 +80,7 @@ def _build_tcn_birnn_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Loa
         rnn_layers=rnn_layers,
         rnn_type=rnn_type,
         output_dim=output_dim,
+        bidirectional=bidirectional,
     )
     model.load_state_dict(state_dict, strict=True)
     return LoadedModel(model=model, input_dim=input_dim, output_dim=output_dim)

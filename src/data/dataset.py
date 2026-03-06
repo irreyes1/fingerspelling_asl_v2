@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -7,26 +7,28 @@ import torch
 from torch.utils.data import Dataset
 
 import pyarrow.parquet as pq
-import pyarrow as pa
 
 MAX_FRAMES_DEFAULT = 160
 
-_RIGHT_HAND_COLS: Optional[List[str]] = None
+_RIGHT_HAND_COLS_BY_PATH: Dict[str, List[str]] = {}
+
 
 def _get_right_hand_cols(parquet_path: str) -> List[str]:
     """
     Detect columns containing 'right_hand' from a parquet schema (cached globally).
     Kaggle ASL Fingerspelling parquets store flattened landmarks per frame as columns.
     """
-    global _RIGHT_HAND_COLS
-    if _RIGHT_HAND_COLS is None:
+    global _RIGHT_HAND_COLS_BY_PATH
+    if parquet_path not in _RIGHT_HAND_COLS_BY_PATH:
         pq_file = pq.ParquetFile(parquet_path)
-        _RIGHT_HAND_COLS = [c for c in pq_file.schema.names if "right_hand" in c]
-        if not _RIGHT_HAND_COLS:
+        cols = [c for c in pq_file.schema.names if "right_hand" in c]
+        if not cols:
             raise ValueError(
                 f"No columns containing 'right_hand' found in parquet schema: {parquet_path}"
             )
-    return _RIGHT_HAND_COLS
+        _RIGHT_HAND_COLS_BY_PATH[parquet_path] = cols
+    return _RIGHT_HAND_COLS_BY_PATH[parquet_path]
+
 
 def read_right_hand_sequence(parquet_path: str, sequence_id: int) -> np.ndarray:
     cols = _get_right_hand_cols(parquet_path)
@@ -38,9 +40,11 @@ def read_right_hand_sequence(parquet_path: str, sequence_id: int) -> np.ndarray:
     X = table.to_pandas().values.astype(np.float32)  # (T, D)
     return X
 
+
 def count_valid_frames(X: np.ndarray) -> int:
     # A frame is valid if not all values are NaN
     return int(np.sum(~np.all(np.isnan(X), axis=1)))
+
 
 def normalize_frames(X: np.ndarray, max_frames: int) -> np.ndarray:
     """
@@ -55,6 +59,40 @@ def normalize_frames(X: np.ndarray, max_frames: int) -> np.ndarray:
         return np.vstack([X, pad])
     return X
 
+
+def _center_and_scale_frames(X: np.ndarray, landmark_scale_mode: str = "median_radius") -> np.ndarray:
+    """
+    Normalize hand landmarks frame-wise:
+    - center around wrist (first landmark xyz)
+    - scale by median 2D radius to reduce distance-to-camera variance
+    """
+    T, D = X.shape
+    if D % 3 != 0:
+        return X
+
+    out = X.copy()
+    pts = out.reshape(T, D // 3, 3)
+    wrist = pts[:, 0:1, :]
+    pts = pts - wrist
+
+    if landmark_scale_mode == "median_radius":
+        radii = np.linalg.norm(pts[:, :, :2], axis=2)  # (T, N)
+        valid = radii > 1e-6
+        scale = np.where(valid, radii, np.nan)
+        scale = np.nanmedian(scale, axis=1)
+        scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0).astype(np.float32)
+        pts = pts / scale[:, None, None]
+
+    return pts.reshape(T, D).astype(np.float32)
+
+
+def _append_delta_features(X: np.ndarray) -> np.ndarray:
+    delta = np.zeros_like(X, dtype=np.float32)
+    if X.shape[0] > 1:
+        delta[1:] = X[1:] - X[:-1]
+    return np.concatenate([X, delta], axis=1).astype(np.float32)
+
+
 class ASLRightHandDataset(Dataset):
     """
     Each item:
@@ -68,10 +106,16 @@ class ASLRightHandDataset(Dataset):
         df: pd.DataFrame,
         landmarks_dir: str,
         max_frames: int = MAX_FRAMES_DEFAULT,
+        use_delta_features: bool = False,
+        normalize_landmarks: bool = False,
+        landmark_scale_mode: str = "median_radius",
     ):
         self.df = df.reset_index(drop=True)
         self.landmarks_dir = landmarks_dir
         self.max_frames = max_frames
+        self.use_delta_features = use_delta_features
+        self.normalize_landmarks = normalize_landmarks
+        self.landmark_scale_mode = landmark_scale_mode
 
     def __len__(self) -> int:
         return len(self.df)
@@ -81,7 +125,10 @@ class ASLRightHandDataset(Dataset):
         file_id = int(row["file_id"])
         sequence_id = int(row["sequence_id"])
 
-        parquet_path = os.path.join(self.landmarks_dir, f"{file_id}.parquet")
+        if "landmarks_subdir" in row and pd.notna(row["landmarks_subdir"]):
+            parquet_path = os.path.join(self.landmarks_dir, str(row["landmarks_subdir"]), f"{file_id}.parquet")
+        else:
+            parquet_path = os.path.join(self.landmarks_dir, f"{file_id}.parquet")
         if not os.path.exists(parquet_path):
             # If parquet missing, mark sample invalid
             return None
@@ -89,8 +136,14 @@ class ASLRightHandDataset(Dataset):
         X_raw = read_right_hand_sequence(parquet_path, sequence_id)  # (T, D)
         input_len = count_valid_frames(X_raw)
 
+        if self.normalize_landmarks:
+            X_raw = _center_and_scale_frames(X_raw, landmark_scale_mode=self.landmark_scale_mode)
+
+        X_raw = np.nan_to_num(X_raw, nan=0.0)
+        if self.use_delta_features:
+            X_raw = _append_delta_features(X_raw)
+
         X = normalize_frames(X_raw, self.max_frames)
-        X = np.nan_to_num(X, nan=0.0)  # model can't handle NaNs
 
         Y = torch.tensor(row["encoded"], dtype=torch.long)
         target_len = int(len(Y))
@@ -101,6 +154,7 @@ class ASLRightHandDataset(Dataset):
 
         X = torch.tensor(X, dtype=torch.float32)
         return X, Y, int(min(input_len, self.max_frames)), target_len
+
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
