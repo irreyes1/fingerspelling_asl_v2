@@ -87,6 +87,17 @@ python -m src.train \
   --use_wandb --wandb_project fingerspelling_asl
 ```
 
+## 4.3) Configuracion versionada del run `tcn_bilstm_gpu_lightning_20260307`
+Script reproducible (para correr en otra maquina remota):
+```bash
+bash scripts/train_tcn_bilstm_gpu_lightning_20260307.sh /ruta/a/data/kaggle
+```
+
+Si omites la ruta, usa por defecto:
+```text
+/teamspace/studios/this_studio/fingerspelling_asl_v2/data/kaggle
+```
+
 Notas:
 - El entrenamiento ahora guarda checkpoint `best` automaticamente.
 - `src.train` soporta train+supplemental y mezcla `train_landmarks` / `supplemental_landmarks`.
